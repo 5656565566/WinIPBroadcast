@@ -1,0 +1,47 @@
+name: Build and Release on Tag
+
+on:
+  push:
+    tags:
+      - 'v*' # 匹配以 v 开头的标签，如 v1.0.0
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v1
+
+    - name: Restore NuGet packages
+      uses: nuget/setup-nuget@v1
+      with:
+        nuget-version: '6.13.1'
+
+    - name: NuGet restore
+      run: nuget restore WinIPBroadcast.sln
+
+    - name: Build Release configuration
+      run: msbuild WinIPBroadcast.sln /p:Configuration=Release /p:Platform="x64" || exit 1
+
+    - name: Prepare release files
+      run: |
+        mkdir release
+        copy "WinIPBroadcast\x64\Release\WinIPBroadcast.exe" "release\"
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          release/WinIPBroadcast.exe
+        draft: false
+        prerelease: false
+        tag_name: ${{ github.ref_name }}
+        name: Release ${{ github.ref_name }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
