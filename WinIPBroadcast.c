@@ -17,6 +17,17 @@
 
 // WinIPBroadcast 1.6 by Etienne Dechamps <etienne@edechamps.fr>
 
+/*
+ * Modified by 56 <2393963330@qq.com>
+ * Modification date: 2025/5/1
+ *
+ * Changes:
+ *
+ * In README.md
+ * 
+ * This modified version is also licensed under GPLv3 or later.
+ */
+
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -39,6 +50,20 @@
 
 #define FORWARDTABLE_INITIAL_SIZE 4096
 
+#define DEDUP_WINDOW_SIZE 100
+#define DEDUP_WINDOW_TIME_MS 1000
+
+typedef struct {
+	ULONG srcAddress;
+	ULONG dstAddress;
+	uint32_t checksum;
+	uint64_t timestamp;
+} PacketSignature;
+
+PacketSignature recentPackets[DEDUP_WINDOW_SIZE];
+int dedupIndex = 0;
+CRITICAL_SECTION dedupLock;
+
 HANDLE mainThread;
 SERVICE_STATUS_HANDLE serviceStatus;
 ULONG loopbackAddress;
@@ -48,6 +73,11 @@ PMIB_IPFORWARDTABLE forwardTable;
 ULONG forwardTableSize;
 
 void quit(void);
+
+void initDedup() {
+	InitializeCriticalSection(&dedupLock);
+	memset(recentPackets, 0, sizeof(recentPackets));
+}
 
 LPTSTR errorString(int err)
 {
@@ -59,11 +89,11 @@ LPTSTR errorString(int err)
 		err,
 		0,
 		buffer,
-		sizeof(buffer),
+		sizeof(buffer) / sizeof(TCHAR),
 		NULL
 	))
-		wcsncpy_s(buffer, sizeof(buffer), TEXT("(cannot format error message)"), sizeof(buffer));
-		
+		wcsncpy_s(buffer, _countof(buffer), TEXT("(cannot format error message)"), _TRUNCATE);
+
 	return buffer;
 }
 
@@ -215,79 +245,171 @@ void computeUdpChecksum(char *payload, uint16_t payloadSize, DWORD srcAddress, D
 	*(WORD *)&payload[UDP_CHECKSUM_POS] = (WORD)(~checksum);
 }
 
-void sendBroadcast(ULONG srcAddress, char *payload, uint16_t payloadSize)
-{
+uint16_t computeChecksum(const uint16_t* data, int length) {
+	uint32_t sum = 0;
+
+	for (int i = 0; i < length / 2; i++) {
+		sum += data[i];
+		if (sum > 0xFFFF) {
+			sum = (sum & 0xFFFF) + (sum >> 16);
+		}
+	}
+
+	if (length % 2) {
+		uint16_t finalByte = ((uint8_t*)data)[length - 1];
+		sum += finalByte;
+		if (sum > 0xFFFF) {
+			sum = (sum & 0xFFFF) + (sum >> 16);
+		}
+	}
+
+	return (uint16_t)~sum;
+}
+
+// Check if we've seen this packet recently
+BOOL isDuplicatePacket(ULONG srcAddress, ULONG dstAddress, char* payload, uint16_t payloadSize) {
+	uint32_t checksum = computeChecksum(payload, payloadSize);
+	uint64_t currentTime = GetTickCount64();
+
+	EnterCriticalSection(&dedupLock);
+
+	BOOL isDuplicate = FALSE;
+	for (int i = 0; i < DEDUP_WINDOW_SIZE; i++) {
+		if (recentPackets[i].srcAddress == srcAddress &&
+			recentPackets[i].dstAddress == dstAddress &&
+			recentPackets[i].checksum == checksum &&
+			(currentTime - recentPackets[i].timestamp) < DEDUP_WINDOW_TIME_MS) {
+			isDuplicate = TRUE;
+			break;
+		}
+	}
+
+	// Add current packet to history
+	recentPackets[dedupIndex].srcAddress = srcAddress;
+	recentPackets[dedupIndex].dstAddress = dstAddress;
+	recentPackets[dedupIndex].checksum = checksum;
+	recentPackets[dedupIndex].timestamp = currentTime;
+	dedupIndex = (dedupIndex + 1) % DEDUP_WINDOW_SIZE;
+
+	LeaveCriticalSection(&dedupLock);
+
+	return isDuplicate;
+}
+
+DWORD GetAdapterIndexFromIp(ULONG ipAddress, PULONG pIfIndex) {
+	PIP_ADAPTER_INFO pAdapterInfo = NULL;
+	PIP_ADAPTER_INFO pAdapter = NULL;
+	ULONG ulOutBufLen = 0;
+	DWORD dwRetVal = 0;
+	DWORD result = ERROR_NOT_FOUND;
+
+	if (GetAdaptersInfo(pAdapterInfo, &ulOutBufLen) == ERROR_BUFFER_OVERFLOW) {
+		pAdapterInfo = (IP_ADAPTER_INFO*)malloc(ulOutBufLen);
+		if (pAdapterInfo == NULL) {
+			return ERROR_NOT_ENOUGH_MEMORY;
+		}
+	}
+
+	if ((dwRetVal = GetAdaptersInfo(pAdapterInfo, &ulOutBufLen)) == NO_ERROR) {
+		for (pAdapter = pAdapterInfo; pAdapter != NULL; pAdapter = pAdapter->Next) {
+			IP_ADDR_STRING* pIpAddrList = &pAdapter->IpAddressList;
+			while (pIpAddrList != NULL) {
+				ULONG adapterIp = inet_addr(pIpAddrList->IpAddress.String);
+				if (adapterIp == ipAddress) {
+					*pIfIndex = pAdapter->Index;
+					result = NO_ERROR;
+					goto cleanup;
+				}
+				pIpAddrList = pIpAddrList->Next;
+			}
+		}
+	}
+	else {
+		result = dwRetVal;
+	}
+
+cleanup:
+	if (pAdapterInfo != NULL) {
+		free(pAdapterInfo);
+	}
+	return result;
+}
+
+void sendBroadcast(ULONG srcAddress, char* payload, uint16_t payloadSize) {
+	// First check for duplicates
+	if (isDuplicatePacket(srcAddress, broadcastAddress, payload, payloadSize)) {
+		return;
+	}
+
 	SOCKET socket;
 	WSABUF wsaBuffer;
 	ULONG block;
 	BOOL broadcastOpt;
 	DWORD len;
 	struct sockaddr_in srcAddr, dstAddr;
+	DWORD ifIndex = 0;
 
 	socket = WSASocket(AF_INET, SOCK_RAW, IPPROTO_UDP, NULL, 0, 0);
-	if (socket == INVALID_SOCKET)
-	{
+
+	if (socket == INVALID_SOCKET) {
 		socketError(TEXT("WSASocket"), FALSE);
 		closesocket(socket);
 		return;
 	}
-	
+
+	// Get interface index for binding
+	if (GetAdapterIndexFromIp(srcAddress, &ifIndex) != NO_ERROR) {
+		socketError(TEXT("GetAdapterIndex"), FALSE);
+		closesocket(socket);
+		return;
+	}
+	// Bind to specific interface
+	if (setsockopt(socket, IPPROTO_IP, IP_MULTICAST_IF, (char*)&srcAddress, sizeof(srcAddress)) == SOCKET_ERROR) {
+		socketError(TEXT("setsockopt(IP_MULTICAST_IF)"), FALSE);
+		closesocket(socket);
+		return;
+	}
 	block = 0;
-	if (WSAIoctl(socket, FIONBIO, &block, sizeof(block), NULL, 0, &len, NULL, NULL) == SOCKET_ERROR)
-	{
+	if (WSAIoctl(socket, FIONBIO, &block, sizeof(block), NULL, 0, &len, NULL, NULL) == SOCKET_ERROR) {
 		socketError(TEXT("WSAIoctl(FIONBIO)"), FALSE);
 		closesocket(socket);
 		return;
 	}
-		
+
 	srcAddr.sin_family = AF_INET;
 	srcAddr.sin_port = 0;
 	srcAddr.sin_addr.s_addr = srcAddress;
-		
-	if (bind(socket, (SOCKADDR *)&srcAddr, sizeof(srcAddr)) == SOCKET_ERROR)
-	{
+	if (bind(socket, (SOCKADDR*)&srcAddr, sizeof(srcAddr)) == SOCKET_ERROR) {
 		socketError(TEXT("bind"), FALSE);
 		closesocket(socket);
 		return;
 	}
-	
 	broadcastOpt = TRUE;
-	if (setsockopt(socket, SOL_SOCKET, SO_BROADCAST, (char *)&broadcastOpt, sizeof(broadcastOpt)) == SOCKET_ERROR)
-	{
+	if (setsockopt(socket, SOL_SOCKET, SO_BROADCAST, (char*)&broadcastOpt, sizeof(broadcastOpt)) == SOCKET_ERROR) {
 		socketError(TEXT("setsockopt(SO_BROADCAST)"), FALSE);
 		closesocket(socket);
 		return;
 	}
-
-	// Any packet we send here will also appear in the input. This can result in an infinite relay loop.
-	// To avoid this, we explicitly set the minimum possible TTL. Incoming packets with this TTL will not be relayed.
-	//
-	// TODO: this is arguably not the best way to solve this problem, because it could also result in packets
-	// getting dropped along the route. Theoretically it should make no difference because broadcast packets can't be
-	// routed anyway (TTL or not), but one can imagine special setups where that might matter. There is also the
-	// problem that if the sending process has the same idea and also sets the TTL to 1, its packets won't be relayed.
-	// A better way would be to implement some kind of content-based deduplication, but that's way more complex.
-	DWORD ttl = 1;
-	if (setsockopt(socket, IPPROTO_IP, IP_TTL, (char*)&ttl, sizeof(ttl)) == SOCKET_ERROR)
-	{
+	// We can now use a normal TTL since we have deduplication
+	DWORD ttl = 128;
+	if (setsockopt(socket, IPPROTO_IP, IP_TTL, (char*)&ttl, sizeof(ttl)) == SOCKET_ERROR) {
 		socketError(TEXT("setsockopt(IP_TTL)"), FALSE);
 		closesocket(socket);
 		return;
 	}
-	
+
 	dstAddr.sin_family = AF_INET;
 	dstAddr.sin_port = 0;
 	dstAddr.sin_addr.s_addr = broadcastAddress;
-	
 	computeUdpChecksum(payload, payloadSize, srcAddress, broadcastAddress);
-	
+
 	wsaBuffer.len = payloadSize;
 	wsaBuffer.buf = payload;
-	
-	if (WSASendTo(socket, &wsaBuffer, 1, &len, 0, (SOCKADDR *)&dstAddr, sizeof(dstAddr), NULL, NULL) != 0)
-		if (WSAGetLastError() != WSAEWOULDBLOCK)
+	if (WSASendTo(socket, &wsaBuffer, 1, &len, 0, (SOCKADDR*)&dstAddr, sizeof(dstAddr), NULL, NULL) != 0) {
+		if (WSAGetLastError() != WSAEWOULDBLOCK) {
 			socketError(TEXT("WSASend"), FALSE);
-		
+		}
+	}
 	closesocket(socket);
 }
 
@@ -336,7 +458,9 @@ void loop()
 	forwardTableSize = FORWARDTABLE_INITIAL_SIZE;
 		
 	initListenSocket();
-	
+
+	initDedup();
+
 	while (TRUE)
 	{
 		len = getBroadcastPacket(buffer, sizeof(buffer), &srcAddress);
@@ -457,6 +581,9 @@ void usage(void)
 	fwprintf(stderr, TEXT("usage: WinIPBroadcast < install | remove | run >\n"));
 	fwprintf(stderr, TEXT("WinIPBroadcast 1.6 by  Etienne Dechamps <etienne@edechamps.fr>\n"));
 	fwprintf(stderr, TEXT("https://github.com/dechamps/WinIPBroadcast\n"));
+	fwprintf(stderr, TEXT("WinIPBroadcast 1.7-iris (modified by 56 <2393963330@qq.com>)\n"));
+	fwprintf(stderr, TEXT("Modification date: 2025/5/1\n"));
+	fwprintf(stderr, TEXT("https://github.com/5656565566/WinIPBroadcast\n"));
 	quit();
 }
 

@@ -1,4 +1,4 @@
-WinIPBroadcast 1.6
+WinIPBroadcast 1.7-iris
 ==================
 
 Author: Etienne Dechamps (a.k.a e-t172) <etienne@edechamps.fr>
@@ -57,3 +57,33 @@ You can use WinIPBroadcast on the command line using these parameters:
 * `WinIPBroadcast install` installs the service.
 * `WinIPBroadcast remove` removes the service.
 * `WinIPBroadcast run` runs WinIPBroadcast as a console application. Useful for diagnostics (error messages will be shown).
+
+About This Modified Version
+---------------------------
+This is a modified version of **WinIPBroadcast 1.6**, originally developed by [Etienne Dechamps](mailto:etienne@edechamps.fr).
+
+## Changes include:
+- **[Version Update]**: Changed from `1.6` to `1.7-iris`
+- Modified network interface bind method
+- Added packet content-based deduplication mechanism, allowing TTL to be set to normal values
+
+## ⚠️ License Notice
+- This modified version remains licensed under **GNU GPLv3**.  
+- Original code copyright belongs to Etienne Dechamps.  
+- Full license text available in [LICENSE](LICENSE.txt) file.  
+
+## 🔗 Original Project
+- Source repository: [[Link](https://github.com/dechamps/WinIPBroadcast)]
+
+Changes include: 
+- **[版本号更新]**：从 `1.6` 修改为 `1.7-iris`
+- 修改了网卡绑定的方式
+- 添加了基于数据包内容的去重的机制，使 TLL 可以被设置为正常值
+
+## ⚠️ 许可证声明
+- 本修改版本仍遵循 **GNU GPLv3** 许可证。  
+- 原始代码版权归 Etienne Dechamps 所有。  
+- 完整许可证文本见 [LICENSE](LICENSE.txt) 文件。  
+
+## 🔗 原始项目
+- 原始代码仓库：[[链接地址](https://github.com/dechamps/WinIPBroadcast)]
